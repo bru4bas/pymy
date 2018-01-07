@@ -3,34 +3,103 @@
 #include <Python.h>
 #include <stdlib.h>
 #include "structmember.h"
+#include "datetime.h"
 
 typedef struct {
    PyObject_HEAD
    MYSQL *con;                               // MySQL connection handler
-} Connection_Object;
+} Database_Object;
 
 typedef struct {
    PyObject_HEAD
-   PyObject *fields;                         // Tuple with field names
+   PyObject *fields;                         // Tuple with field names (Python strings)
+   int *types;                               // Types of MySQL individual fields
    MYSQL_RES *res;                           // MySQL stored result 
    MYSQL_ROW last;                           // last read row from result
    unsigned row;                             // last row index
    unsigned num_rows;                        // total number of rows in result
-} Result_Object;
+} Table_Object;
 
 void 
-Result_dealloc(PyObject *self)
+Table_dealloc(PyObject *self)
 {
-   Result_Object *s = (Result_Object*)self;
+   Table_Object *s = (Table_Object*)self;
    mysql_free_result(s->res);
    Py_XDECREF(s->fields);
+   free(s->types);
    Py_TYPE(self)->tp_free(self);
 }
 
 PyObject *
-Result_getitem(PyObject *self, Py_ssize_t index)
+convert_mysql_value(char *cvalue, unsigned type)
 {
-   Result_Object *s = (Result_Object*)self;
+   PyObject *res;
+   if(cvalue == NULL) {
+      /*
+       * NULL values return None type
+       */
+      Py_INCREF(Py_None);
+      return Py_None;
+   }
+
+   switch(type) {
+      /*
+       * Integer types.
+       */
+      case MYSQL_TYPE_TINY:
+      case MYSQL_TYPE_SHORT:
+      case MYSQL_TYPE_LONG:
+      case MYSQL_TYPE_INT24:
+      case MYSQL_TYPE_LONGLONG:
+         res = PyInt_FromString(cvalue, NULL, 10);
+         break;
+
+      /*
+       * Floating point types.
+       */
+      case MYSQL_TYPE_DECIMAL:
+      case MYSQL_TYPE_NEWDECIMAL:
+      case MYSQL_TYPE_FLOAT:
+      case MYSQL_TYPE_DOUBLE:
+         res = PyFloat_FromDouble(atof(cvalue));
+         break;
+
+      /*
+       * Date types.
+       */
+      case MYSQL_TYPE_DATE:
+         res = PyDate_FromDate(atoi(cvalue), atoi(cvalue+5), atoi(cvalue+8));
+         break;
+
+      case MYSQL_TYPE_TIME:
+         res = PyTime_FromTime(atoi(cvalue), atoi(cvalue+3), atoi(cvalue+6), 0);
+         break;
+
+      case MYSQL_TYPE_DATETIME:
+         res = PyDateTime_FromDateAndTime(atoi(cvalue), atoi(cvalue+5), atoi(cvalue+8),
+                                          atoi(cvalue+11), atoi(cvalue+14), atoi(cvalue+17), 0);
+         break;
+
+      case MYSQL_TYPE_TIMESTAMP:
+         res = PyDateTime_FromDateAndTime(atoi(cvalue), atoi(cvalue+5), atoi(cvalue+8),
+                                          atoi(cvalue+11), atoi(cvalue+14), atoi(cvalue+17), atoi(cvalue+20));
+         break;
+
+      /*
+       * All the rest are kept as strings
+       */
+      default:
+         res = PyString_FromString(cvalue);
+         break;
+   }
+
+   return res;
+}
+
+PyObject *
+Table_getitem(PyObject *self, Py_ssize_t index)
+{
+   Table_Object *s = (Table_Object*)self;
    if(index != s->row) {
       /*
        * Read a different row from MySQL stored result.
@@ -58,20 +127,10 @@ Result_getitem(PyObject *self, Py_ssize_t index)
    unsigned n = PyTuple_Size(s->fields);
    for(i=0; i<n; i++) {
       PyObject *key = PyTuple_GetItem(s->fields, i);
-      PyObject *value;
-      char *cvalue = s->last[i];
-      if(cvalue == NULL) {
-         /*
-          * No value or NULL translated into None
-          */
-         value = Py_None;
-         Py_INCREF(Py_None);
-      } else {
-         value = PyString_FromString(cvalue);
-         if(value == NULL) {
-            Py_DECREF(item);
-            return NULL;
-         }
+      PyObject *value = convert_mysql_value(s->last[i], s->types[i]);
+      if(value == NULL) {
+         Py_DECREF(item);
+         return NULL;
       }
       if(PyDict_SetItem(item, key, value) < 0) {
          Py_DECREF(item);
@@ -83,9 +142,9 @@ Result_getitem(PyObject *self, Py_ssize_t index)
 }
 
 PyObject *
-Result_getcolumn(PyObject *self, PyObject *args)
+Table_getcolumn(PyObject *self, PyObject *args)
 {
-   Result_Object *s = (Result_Object*)self;
+   Table_Object *s = (Table_Object*)self;
    char *field;
 
    if(!PyArg_ParseTuple(args, "s", &field)) return NULL;
@@ -112,33 +171,27 @@ Result_getcolumn(PyObject *self, PyObject *args)
    for(j=0; j<s->num_rows; j++) {
       s->row = j;
       s->last = mysql_fetch_row(s->res);
-      char *cvalue = s->last[i];
-      if(cvalue == NULL) {
-         Py_INCREF(Py_None);
-         PyTuple_SetItem(col, j, Py_None); 
-      } else {
-         PyTuple_SetItem(col, j, PyString_FromString(cvalue));
-      }
+      PyTuple_SetItem(col, j, convert_mysql_value(s->last[i], s->types[i]));
    }
 
    return col;
 }
 
 Py_ssize_t 
-Result_getsize(PyObject *self)
+Table_getsize(PyObject *self)
 {
-   Result_Object *s = (Result_Object*)self;
+   Table_Object *s = (Table_Object*)self;
    return s->num_rows;
 }
 
 /*
- * Result can work as a (imutable) sequence.
+ * Table can work as a (imutable) sequence.
  */
-static PySequenceMethods Result_as_sequence = {
-   Result_getsize,                                 /* sq_length */
+static PySequenceMethods Table_as_sequence = {
+   Table_getsize,                                  /* sq_length */
    0,                                              /* sq_concat */
    0,                                              /* sq_repeat */
-   Result_getitem,                                 /* sq_item */
+   Table_getitem,                                  /* sq_item */
    0,                                              /* sq_ass_item */
    0,                                              /* sq_contains */
    0,                                              /* sq_inplace_concat */
@@ -146,37 +199,37 @@ static PySequenceMethods Result_as_sequence = {
 };
 
 /*
- * Members for Result Object
+ * Members for Table Object
  */
-static PyMemberDef Result_members[] = {
-   { "fields", T_OBJECT, offsetof(Result_Object, fields), READONLY, "Field names" },
+static PyMemberDef Table_members[] = {
+   { "fields", T_OBJECT, offsetof(Table_Object, fields), READONLY, "Field names" },
    { NULL }
 };
 
 /*
- * C Methods for Result Object
+ * C Methods for Table Object
  */
-static PyMethodDef Result_methods[] = {
-   { "column", (PyCFunction)Result_getcolumn, METH_VARARGS, "Tuple with all values of the column" },
+static PyMethodDef Table_methods[] = {
+   { "column", (PyCFunction)Table_getcolumn, METH_VARARGS, "Tuple with all values of the column" },
    { NULL }
 };
 
 /*
- * Result Type definition for Python
+ * Table Type definition for Python
  */
-static PyTypeObject Result_Type = {
+static PyTypeObject Table_Type = {
    PyVarObject_HEAD_INIT(NULL, 0)
-   "mysqldb.Result",                               /* tp_name */
-   sizeof(Result_Object),                          /* tp_basicsize */
+   "pymy.Table",                                   /* tp_name */
+   sizeof(Table_Object),                           /* tp_basicsize */
    0,                                              /* tp_itemsize */
-   (destructor)Result_dealloc,                     /* tp_dealloc */
+   (destructor)Table_dealloc,                      /* tp_dealloc */
    0,                                              /* tp_print */
    0,                                              /* tp_getattr */
    0,                                              /* tp_setattr */
    0,                                              /* tp_compare */
    0,                                              /* tp_repr */
    0,                                              /* tp_as_number */
-   &Result_as_sequence,                            /* tp_as_sequence */
+   &Table_as_sequence,                             /* tp_as_sequence */
    0,                                              /* tp_as_mapping */
    0,                                              /* tp_hash */
    0,                                              /* tp_call */
@@ -185,15 +238,15 @@ static PyTypeObject Result_Type = {
    0,                                              /* tp_setattro */
    0,                                              /* tp_as_buffer */
    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,       /* tp_flags */
-   "MySQL Query Results",                          /* tp_doc */
+   "A Table with MySQL Query Results",             /* tp_doc */
    0,                                              /* tp_traverse */
    0,                                              /* tp_clear */
    0,                                              /* tp_richcompare */
    0,                                              /* tp_weaklistoffset */
    0,                                              /* tp_iter */
    0,                                              /* tp_iternext */
-   Result_methods,                                 /* tp_methods */
-   Result_members,                                 /* tp_members */
+   Table_methods,                                  /* tp_methods */
+   Table_members,                                  /* tp_members */
    0,                                              /* tp_getset */
    0,                                              /* tp_base */
    0,                                              /* tp_dict */
@@ -206,9 +259,9 @@ static PyTypeObject Result_Type = {
 };
 
 static PyObject *
-Connection_new(PyTypeObject *type, PyObject *args, PyObject *keywords)
+Database_new(PyTypeObject *type, PyObject *args, PyObject *keywords)
 {
-   Connection_Object *self = (Connection_Object*)type->tp_alloc(type, 0);
+   Database_Object *self = (Database_Object*)type->tp_alloc(type, 0);
    if(self != NULL) {
       self->con = mysql_init(NULL);
       if(self->con == NULL) {
@@ -222,17 +275,18 @@ Connection_new(PyTypeObject *type, PyObject *args, PyObject *keywords)
 }
 
 void
-Connection_dealloc(PyObject *self)
+Database_dealloc(PyObject *self)
 {
-   Connection_Object *s = (Connection_Object*)self;
+   Database_Object *s = (Database_Object*)self;
    if(s->con != NULL)
       mysql_close(s->con);
    Py_TYPE(self)->tp_free(self);
 }
 
 static int
-Connection_init(Connection_Object *self, PyObject *args, PyObject *keywords)
+Database_init(Database_Object *self, PyObject *args, PyObject *keywords)
 {
+   MYSQL *res;
    static char *keys[] = { "database", "host", "user", "password", NULL };
    char *db;
    char *host = "localhost";
@@ -242,7 +296,11 @@ Connection_init(Connection_Object *self, PyObject *args, PyObject *keywords)
    if(!PyArg_ParseTupleAndKeywords(args, keywords, "s|sss", keys, &db, &host, &user, &pwd))
       return -1;
    
-   if(mysql_real_connect(self->con, host, user, pwd, db, 0, NULL, 0) == NULL) {
+   Py_BEGIN_ALLOW_THREADS
+   res = mysql_real_connect(self->con, host, user, pwd, db, 0, NULL, 0);
+   Py_END_ALLOW_THREADS
+
+   if(res == NULL) {
       PyErr_SetString(PyExc_RuntimeError, mysql_error(self->con));
       return -1;
    }
@@ -251,16 +309,22 @@ Connection_init(Connection_Object *self, PyObject *args, PyObject *keywords)
 }
 
 static PyObject *
-Connection_query(PyObject *self, PyObject *args)
+Database_query(PyObject *self, PyObject *args)
 {
    char *query;
-   Connection_Object *s = (Connection_Object*)self;
+   int nok;
+   MYSQL_RES *res;
+   Database_Object *s = (Database_Object*)self;
 
    /*
     * Send query to MySQL server
     */
    if(!PyArg_ParseTuple(args, "s", &query)) return NULL;
-   if(mysql_query(s->con, query)) {
+   Py_BEGIN_ALLOW_THREADS
+   nok = mysql_query(s->con, query);
+   Py_END_ALLOW_THREADS
+
+   if(nok) {
       PyErr_SetString(PyExc_RuntimeError, mysql_error(s->con));
       return NULL;
    }
@@ -268,7 +332,10 @@ Connection_query(PyObject *self, PyObject *args)
    /*
     * Read back results (store to memory).
     */
-   MYSQL_RES *res = mysql_store_result(s->con);
+   Py_BEGIN_ALLOW_THREADS
+   res = mysql_store_result(s->con);
+   Py_END_ALLOW_THREADS
+
    if(res == NULL) {
       PyErr_SetString(PyExc_RuntimeError, mysql_error(s->con));
       return NULL;
@@ -288,9 +355,9 @@ Connection_query(PyObject *self, PyObject *args)
    }
 
    /*
-    * Create new Result object.
+    * Create new Table object.
     */
-   Result_Object *result = PyObject_New(Result_Object, &Result_Type);
+   Table_Object *result = PyObject_New(Table_Object, &Table_Type);
    if(result == NULL) {
       mysql_free_result(res);
       return NULL;
@@ -305,27 +372,33 @@ Connection_query(PyObject *self, PyObject *args)
     * Create new Tuple with fields' names
     */
    result->fields = PyTuple_New(fields);
+   result->types = malloc(fields * sizeof(int));
    unsigned i;
    for(i=0; ;i++) {
       MYSQL_FIELD *f = mysql_fetch_field(res);
       if(f == NULL) break;
       PyTuple_SetItem(result->fields, i, PyString_FromString(f->name));
+      result->types[i] = (int)f->type;
    }
 
    return (PyObject*)result;
 }
 
 static PyObject *
-Connection_exec(PyObject *self, PyObject *args)
+Database_exec(PyObject *self, PyObject *args)
 {
    char *query;
-   Connection_Object *s = (Connection_Object*)self;
+   int nok;
+   Database_Object *s = (Database_Object*)self;
 
    /*
     * Send query to MySQL server
     */
    if(!PyArg_ParseTuple(args, "s", &query)) return NULL;
-   if(mysql_query(s->con, query)) {
+   Py_BEGIN_ALLOW_THREADS
+   nok = mysql_query(s->con, query);
+   Py_END_ALLOW_THREADS
+   if(nok) {
       PyErr_SetString(PyExc_RuntimeError, mysql_error(s->con));
       return NULL;
    }
@@ -339,21 +412,21 @@ Connection_exec(PyObject *self, PyObject *args)
 /*
  * C Methods for Connection Object
  */
-static PyMethodDef Connection_methods[] = {
-   { "query", (PyCFunction)Connection_query, METH_VARARGS, "Execute a SQL query and return a result (None) if no result" },
-   { "execute", (PyCFunction)Connection_exec, METH_VARARGS, "Execute a SQL command and return the number of affected rows" },
+static PyMethodDef Database_methods[] = {
+   { "query", (PyCFunction)Database_query, METH_VARARGS, "Execute a SQL query and return a result (None) if no result" },
+   { "execute", (PyCFunction)Database_exec, METH_VARARGS, "Execute a SQL command and return the number of affected rows" },
    { NULL }
 };
 
 /*
  * Connection Type definition for Python
  */
-static PyTypeObject Connection_Type = {
+static PyTypeObject Database_Type = {
    PyVarObject_HEAD_INIT(NULL, 0)
-   "mysqldb.Connection",                           /* tp_name */
-   sizeof(Connection_Object),                      /* tp_basicsize */
+   "pymy.Database",                                /* tp_name */
+   sizeof(Database_Object),                        /* tp_basicsize */
    0,                                              /* tp_itemsize */
-   (destructor)Connection_dealloc,                 /* tp_dealloc */
+   (destructor)Database_dealloc,                   /* tp_dealloc */
    0,                                              /* tp_print */
    0,                                              /* tp_getattr */
    0,                                              /* tp_setattr */
@@ -369,14 +442,14 @@ static PyTypeObject Connection_Type = {
    0,                                              /* tp_setattro */
    0,                                              /* tp_as_buffer */
    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,       /* tp_flags */
-   "MySQL Connection abstraction",                 /* tp_doc */
+   "MySQL Database Connection abstraction",        /* tp_doc */
    0,                                              /* tp_traverse */
    0,                                              /* tp_clear */
    0,                                              /* tp_richcompare */
    0,                                              /* tp_weaklistoffset */
    0,                                              /* tp_iter */
    0,                                              /* tp_iternext */
-   Connection_methods,                             /* tp_methods */
+   Database_methods,                               /* tp_methods */
    0,                                              /* tp_members */
    0,                                              /* tp_getset */
    0,                                              /* tp_base */
@@ -384,9 +457,9 @@ static PyTypeObject Connection_Type = {
    0,                                              /* tp_descr_get */
    0,                                              /* tp_descr_set */
    0,                                              /* tp_dictoffset */
-   (initproc)Connection_init,                      /* tp_init */
+   (initproc)Database_init,                        /* tp_init */
    0,                                              /* tp_alloc */
-   Connection_new,                                 /* tp_new */
+   Database_new,                                   /* tp_new */
 };
 
 static PyMethodDef module_methods[] = {
@@ -397,29 +470,29 @@ static PyMethodDef module_methods[] = {
 #define PyMODINIT_FUNC void
 #endif
 PyMODINIT_FUNC
-initmysqldb(void)
+initpymy(void)
 {
    PyObject* module;
 
    /*
     * Initialize new object types 
     */
-   if (PyType_Ready(&Connection_Type) < 0) return;
-   if (PyType_Ready(&Result_Type) < 0) return;
+   if (PyType_Ready(&Database_Type) < 0) return;
+   if (PyType_Ready(&Table_Type) < 0) return;
 
    /*
     * Create a Python module
     */
-   module = Py_InitModule3("mysqldb", module_methods, "MySQL wrapper module");
+   module = Py_InitModule3("pymy", module_methods, "MySQL wrapper module");
    if (module == NULL) return;
 
    /*
     * Add Connection class into module's namespace.
     */
-   Py_INCREF(&Connection_Type);
-   PyModule_AddObject(module, "Connection", (PyObject *)&Connection_Type);
-   
-//   Py_INCREF(&Result_Type);
-//   PyModule_AddObject(m, "Result", (PyObject *)&Result_Type);
+   Py_INCREF(&Database_Type);
+   Py_INCREF(&Table_Type);
+   PyModule_AddObject(module, "Database", (PyObject *)&Database_Type);
+
+   PyDateTime_IMPORT ;
 }
 

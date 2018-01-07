@@ -5,15 +5,15 @@ from subprocess import check_output
 compile_args = check_output(['mysql_config', '--cflags'])
 link_args = check_output(['mysql_config', '--libs'])
 
-sources = [ 'src/mysqldb.c' ]
+sources = [ 'src/pymy.c' ]
 
-ext = Extension( 'mysqldb',
+ext = Extension( 'pymy',
                  sources,
                  extra_compile_args = compile_args.split(),
                  extra_link_args = link_args.split())
 
 setup(
-    name="mysqldb", version="1.0",
+    name="pymy", version="0.2",
     ext_modules=[ ext ])
 
 
